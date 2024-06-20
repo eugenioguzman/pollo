@@ -4,7 +4,7 @@
 use std::{borrow::Cow, cmp::max, collections::VecDeque, fs::File, io::Write, iter::zip, path::PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelBridge, ParallelIterator};
-use ndarray::{azip, Array1, Array2};
+use ndarray::{azip, Array1, Array2, Axis};
 use rust_htslib::bcf::{self, Read};
 use serde::{Deserialize, Serialize};
 use rayon::*;
@@ -211,16 +211,9 @@ impl GuiderGenerator {
         }
     }
     fn get_ij_arrs<T: Clone>(&self, row: &Array1<T>) -> (Array1<T>, Array1<T>) {
-        //let i = row.select(Axis(0), &self.i_viewer);
-        //let j = row.select(Axis(0), &self.j_viewer);
-        //(i, j)
-        let mut iv = Vec::with_capacity(self.i_viewer.len());
-        let mut jv = Vec::with_capacity(self.j_viewer.len());
-        for (i, j) in zip(self.i_viewer.iter(), self.j_viewer.iter()) {
-            iv.push(row[*i].clone());
-            jv.push(row[*j].clone());
-        }
-        (Array1::from_vec(iv), Array1::from_vec(jv))
+        let i = row.select(Axis(0), &self.i_viewer);
+        let j = row.select(Axis(0), &self.j_viewer);
+        (i, j)
     }
 }
 
