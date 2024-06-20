@@ -4,13 +4,13 @@
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
 ##FORMAT=<ID=PQ,Number=1,Type=Integer,Description="Phasing quality">
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	AB	BC	AC	BB
-Z	1	.	G	T	0	.	.	GT:PQ	0|1:7	1|0:7	1|1:100	0|0:100
-Z	2	.	G	T	0	.	.	GT:PQ	1|0:7	0|1:7	0|0:100	1|1:100
-Z	3	.	G	T	0	.	.	GT:PQ	1|0:4	1|1:100	1|0:5	1|1:100
+Z	1	.	G	T	0	.	.	GT:PQ	0|1:8	0|1:6	1|1:100	0|0:100
+Z	2	.	G	T	0	.	.	GT:PQ	1|0:8	1|0:6	0|0:100	1|1:100
+Z	3	.	G	T	0	.	.	GT:PQ	1|0:5	1|1:100	1|0:5	1|1:100
 Z	4	.	G	T	0	.	.	GT:PQ	0|0:100	0|0:100	0|0:100	0|0:100
 Z	5	.	G	T	0	.	.	GT:PQ	1|1:100	1|1:100	1|1:100	1|1:100
-Z	6	.	G	T	0	.	.	GT:PQ	0|0:100	1|0:5	1|0:4	0|0:100
-Z	7	.	G	T	0	.	.	GT:PQ	1|0:7	0|1:7	0|0:100	1|1:100
-Z	8	.	G	T	0	.	.	GT:PQ	0|1:7	1|0:7	1|1:100	0|0:100
-Z	9	.	G	T	0	.	.	GT:PQ	1|0:4	1|1:100	1|0:5	1|1:100
-Z	10	.	G	T	0	.	.	GT:PQ	0|1:7	1|0:7	1|1:100	0|0:100
+Z	6	.	G	T	0	.	.	GT:PQ	0|0:100	0|1:4	1|0:4	0|0:100
+Z	7	.	G	T	0	.	.	GT:PQ	1|0:8	1|0:6	0|0:100	1|1:100
+Z	8	.	G	T	0	.	.	GT:PQ	0|1:8	0|1:6	1|1:100	0|0:100
+Z	9	.	G	T	0	.	.	GT:PQ	1|0:5	1|1:100	1|0:5	1|1:100
+Z	10	.	G	T	0	.	.	GT:PQ	0|1:8	0|1:6	1|1:100	0|0:100
