@@ -4,7 +4,7 @@
 use std::{borrow::Cow, cmp::max, collections::VecDeque, fs::File, io::Write, iter::zip, path::PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelBridge, ParallelIterator};
-use ndarray::{azip, Array1, Array2, Axis};
+use ndarray::{Array1, Array2, ArrayBase, Axis, Dimension, OwnedRepr, RemoveAxis};
 use rust_htslib::bcf::{self, Read};
 use serde::{Deserialize, Serialize};
 use rayon::*;
@@ -126,7 +126,7 @@ struct Dists {
 fn quick_read(file: &PathBuf) -> Result<(Vec<Option<Dists>>, Vec<String>, Vec<String>), QuickReadError> {
     let mut reader = bcf::Reader::from_path(file)?;
     let samples: Vec<String> = bcf::Read::header(&reader).samples().iter().map(|v| String::from_utf8_lossy(*v).into_owned()).collect();
-    let tri_iter = Vec::from_iter((0..triangular_matrix_len(samples.len())).map(|i| triangular_matrix_ij(i)));
+    let cct = CrossCmpTri::new(samples.len());
     let mut chrom_dists = vec![None; reader.header().contig_count() as usize];
     for (rn, rec_result) in reader.records().enumerate() {
         let rec = match rec_result {
@@ -159,35 +159,25 @@ fn quick_read(file: &PathBuf) -> Result<(Vec<Option<Dists>>, Vec<String>, Vec<St
         };
         
         let gts_raw = rec.genotypes()?;
-        let mut poisoned = vec![false; samples.len()];
+        let mut poisoned = Array1::ones([samples.len()]);
         let mut rows = Array2::<i8>::zeros([samples.len(), rec.allele_count() as usize]);
         for i in 0..samples.len() {
             let gt = gts_raw.get(i);
             for a in gt.iter() {
                 match get_allele(a) {
                     Some(k) => { rows[[i, k as usize]] += 1; },
-                    None => { poisoned[i] = true; },
+                    None => { poisoned[i] = 0; },
                 }
             };
         }
         
-        vec![vec![0; rec.allele_count().try_into()?]; samples.len()];
 
-        zip(tri_iter.iter(), zip(cd.dist.arr.iter_mut(), cd.cmps.arr.iter_mut())).par_bridge().for_each(|((i, j), (dist, cmps))| {
-            let p1 = poisoned[*i];
-            let p2 = poisoned[*j];
-            if p1 || p2 {
-                return
-            }
-            
-            let distance = if j != i { 
-                let mut diff = Array1::zeros([rec.allele_count() as usize]);
-                azip!((gt1 in rows.row(*i), gt2 in rows.row(*j), d in &mut diff) *d = (gt1 - gt2).max(0));
-                diff.sum()
-            } else { 0 };
-            *dist += distance as u128;
-            *cmps += 1;
-        });
+        let (gt_i, gt_j) = cct.get_ij_arrs(&rows);
+        let (ms_i, ms_j) = cct.get_ij_arrs(&poisoned);
+        let missing_mask = ms_i * ms_j;
+        let distances =  (gt_i - gt_j).fold_axis(Axis(1), 0, |acc, v| v.max(&0) + acc) * &missing_mask;
+        cd.dist.arr += &distances.map(|x| *x as u128);
+        cd.cmps.arr += &missing_mask.map(|x| *x as u128);
     }
     let mut chrom_names = Vec::with_capacity(chrom_dists.len());
     for i in 0..chrom_dists.len() {
@@ -197,20 +187,24 @@ fn quick_read(file: &PathBuf) -> Result<(Vec<Option<Dists>>, Vec<String>, Vec<St
 }
 
 
-struct GuiderGenerator {
+struct CrossCmpTri {
     i_viewer: Vec<usize>,
     j_viewer: Vec<usize>
 }
 
-impl GuiderGenerator {
-    fn new(nsamples: usize) -> GuiderGenerator {
+impl CrossCmpTri {
+    fn new(nsamples: usize) -> CrossCmpTri {
         let (iv, jv) = (0..triangular_matrix_len(nsamples)).map(|i| triangular_matrix_ij(i)).unzip();
-        GuiderGenerator {
+        CrossCmpTri {
             i_viewer: iv,
             j_viewer: jv
         }
     }
-    fn get_ij_arrs<T: Clone>(&self, row: &Array1<T>) -> (Array1<T>, Array1<T>) {
+    fn get_ij_arrs<T, D>(&self, row: &ArrayBase<OwnedRepr<T>, D>) -> (ArrayBase<OwnedRepr<T>, D>, ArrayBase<OwnedRepr<T>, D>)
+    where
+        T: Clone,
+        D: Dimension + RemoveAxis
+    {
         let i = row.select(Axis(0), &self.i_viewer);
         let j = row.select(Axis(0), &self.j_viewer);
         (i, j)
@@ -241,13 +235,13 @@ fn gen_guiders(dists: &Vec<Option<Dists>>, limit: Option<usize>) -> Vec<Option<V
         let mut corr = -d.dist.map(|x| *x as f64) / (d.cmps.map(|x| *x as f64) * (PLOIDY as f64)) + 1f64;
         corr.fillna(0.);
         let corr = corr;
-        let gg = GuiderGenerator::new(corr.size);
+        let cct = CrossCmpTri::new(corr.size);
         let mut chr_guiders: Vec<Option<[Vec<(usize, f64)>; 2]>> = vec![None; corr.size];
 
 
         chr_guiders.par_iter_mut().enumerate().for_each(|(x, target)| {
             let arr_x = corr.row(x);
-            let (arr_xi, arr_xj) = gg.get_ij_arrs(&arr_x);
+            let (arr_xi, arr_xj) = cct.get_ij_arrs(&arr_x);
             let arr_ij = &corr.arr;
             let result = TriangularMatrix {
                 arr: arr_xi*arr_xj/arr_ij,
@@ -258,7 +252,7 @@ fn gen_guiders(dists: &Vec<Option<Dists>>, limit: Option<usize>) -> Vec<Option<V
                 .map(|(i, v)| (triangular_matrix_ij(i), *v))
                 .filter(|((pi, pj), _)| (*pi != x) && (*pj != x) && (*pi != *pj))
                 .reduce(
-                    || ((0usize, 10usize), f64::NEG_INFINITY),
+                    || ((usize::MAX, usize::MAX), f64::NEG_INFINITY),
                     |((opi, opj), ov), ((npi, npj), nv)| {
                         if nv > ov {
                             ((npi, npj), nv)
