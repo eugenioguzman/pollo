@@ -1,10 +1,9 @@
 #![feature(isqrt)]
 #![feature(iterator_try_collect)]
 
-use std::{borrow::Cow, cmp::max, collections::VecDeque, fs::File, io::Write, iter::zip, path::PathBuf};
+use std::{borrow::Cow, cmp::max, collections::{BTreeMap, VecDeque}, fs::File, io::Write, iter::zip, path::PathBuf, sync::Mutex, thread::{self, Thread}};
 use clap::{Parser, Subcommand, ValueEnum};
 use iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelBridge, ParallelIterator};
-use ndarray::{Array1, Array2, ArrayBase, Axis, Dimension, OwnedRepr, RemoveAxis};
 use rust_htslib::bcf::{self, Read};
 use serde::{Deserialize, Serialize};
 use rayon::*;
@@ -39,7 +38,9 @@ enum Commands {
         #[arg(short='g', long)]
         max_guiders: Option<usize>,
         #[arg(value_enum, short='O', long)]
-        output_type: Option<VcfOutputType>
+        output_type: Option<VcfOutputType>,
+        #[arg(short, long)]
+        use_stats: Option<PathBuf>,
     },
 }
 
@@ -123,62 +124,107 @@ struct Dists {
     cmps: TriangularMatrix<u128>
 }
 
+impl std::ops::Add<Self> for Dists {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Dists {
+            dist: self.dist + rhs.dist,
+            cmps: self.cmps + rhs.cmps
+        }
+    }
+}
+
+
+impl std::ops::AddAssign<Self> for Dists {
+    fn add_assign(&mut self, rhs: Self) {
+        self.dist += rhs.dist;
+        self.cmps += rhs.cmps;
+    }
+}
+
+impl std::ops::AddAssign<&Self> for Dists {
+    fn add_assign(&mut self, rhs: &Self) {
+        for (a, b) in zip(self.dist.vec.iter_mut(), rhs.dist.vec.iter()) {
+            *a += *b;
+        }
+        for (a, b) in zip(self.cmps.vec.iter_mut(), rhs.cmps.vec.iter()) {
+            *a += *b;
+        }
+    }
+}
+
 fn quick_read(file: &PathBuf) -> Result<(Vec<Option<Dists>>, Vec<String>, Vec<String>), QuickReadError> {
     let mut reader = bcf::Reader::from_path(file)?;
-    let samples: Vec<String> = bcf::Read::header(&reader).samples().iter().map(|v| String::from_utf8_lossy(*v).into_owned()).collect();
-    let cct = CrossCmpTri::new(samples.len());
-    let mut chrom_dists = vec![None; reader.header().contig_count() as usize];
-    for (rn, rec_result) in reader.records().enumerate() {
+    let samples: Vec<String> = bcf::Read::header(&reader).samples().iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect();
+    let nsamples = samples.len();
+    let cct = CrossCmpTri::new(nsamples);
+    let ncontigs = reader.header().contig_count() as usize;
+    let chrom_dists = reader.records().enumerate().par_bridge().map(|(rn, rec_result)| {
+
         let rec = match rec_result {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("skipping record {} due to problem: {}", rn, e.to_string());
-                continue
+                return None
             }
         };
 
         let rid = match rec.rid() {
-            Some(x) => x,
-            None => continue
+            Some(x) => x as usize,
+            None => return None
         };
 
-
-        let cd = match chrom_dists.get_mut(rid as usize) {
-            Some(x) => match x {
-                Some(y) => y,
-                None => {
-                    let y = Dists {
-                        dist: TriangularMatrix::zeros(samples.len()),
-                        cmps: TriangularMatrix::zeros(samples.len())
-                    };
-                    *x = Some(y);
-                    x.as_mut().unwrap()
-                },
-            },
-            None => continue,
-        };
         
-        let gts_raw = rec.genotypes()?;
-        let mut poisoned = Array1::ones([samples.len()]);
-        let mut rows = Array2::<i8>::zeros([samples.len(), rec.allele_count() as usize]);
-        for i in 0..samples.len() {
+        let gts_raw = rec.genotypes().expect("unable to read genotypes");
+        let mut sample_missing_mask = vec![false; nsamples];
+        let ac = rec.allele_count() as usize;
+        let mut gts_vec2d = vec![0i8; nsamples * ac];
+        for (i, smm) in sample_missing_mask.iter_mut().enumerate().take(nsamples) {
             let gt = gts_raw.get(i);
+            let rowidx = i * ac;
             for a in gt.iter() {
                 match get_allele(a) {
-                    Some(k) => { rows[[i, k as usize]] += 1; },
-                    None => { poisoned[i] = 0; },
+                    Some(k) => { gts_vec2d[rowidx + (k as usize)] += 1; },
+                    None => { *smm = true; },
                 }
             };
         }
         
 
-        let (gt_i, gt_j) = cct.get_ij_arrs(&rows);
-        let (ms_i, ms_j) = cct.get_ij_arrs(&poisoned);
-        let missing_mask = ms_i * ms_j;
-        let distances =  (gt_i - gt_j).fold_axis(Axis(1), 0, |acc, v| v.max(&0) + acc) * &missing_mask;
-        cd.dist.arr += &distances.map(|x| *x as u128);
-        cd.cmps.arr += &missing_mask.map(|x| *x as u128);
-    }
+        let (gt_i, gt_j) = cct.get_ij_arrs(&gts_vec2d, ac);
+        let (ms_i, ms_j) = cct.get_ij_arrs(&sample_missing_mask, 1);
+        let missing_mask = Vec::from_iter(zip(ms_i.iter(), ms_j.iter()).map(|(a,b)| (*a) | (*b)));
+        let distances = Vec::from_iter(
+            zip(zip(gt_i.chunks_exact(ac), gt_j.chunks_exact(ac)), missing_mask.iter())
+            .map(|((a, b), c)| if *c {0} else {zip(a, b).fold(0, |acc, (x, y)| acc + max(*x - *y, 0) as u128)})
+        );
+
+        Some((rid, Dists {
+            dist: TriangularMatrix{vec: Vec::from_iter(distances), size: nsamples},
+            cmps: TriangularMatrix{vec: Vec::from_iter(missing_mask.into_iter().map(|x| if x {0} else {1})), size: nsamples}
+        }))
+    }).fold(|| vec![None; ncontigs], |mut acc: Vec<Option<Dists>>, incr| {
+        if let Some((rid, inc_dists)) = incr {
+            match acc.get_mut(rid).unwrap() {
+                Some(v) => *v += inc_dists,
+                None => *acc.get_mut(rid).unwrap() = Some(inc_dists),
+            };
+        }
+        acc
+    }).reduce(|| vec![None; ncontigs], |mut acc, incr| {
+        for (target_dists, incr_dists) in zip(acc.iter_mut(), incr.iter()) {
+            if let Some(targ_d) = target_dists {
+                if let Some(incr_d) = incr_dists {
+                    *targ_d += incr_d
+                }
+            } else {
+                *target_dists = incr_dists.clone();
+            }
+        }
+        acc
+    });
+
     let mut chrom_names = Vec::with_capacity(chrom_dists.len());
     for i in 0..chrom_dists.len() {
         chrom_names.push(String::from_utf8_lossy(reader.header().rid2name(i.try_into()?).unwrap()).into_owned());
@@ -194,19 +240,20 @@ struct CrossCmpTri {
 
 impl CrossCmpTri {
     fn new(nsamples: usize) -> CrossCmpTri {
-        let (iv, jv) = (0..triangular_matrix_len(nsamples)).map(|i| triangular_matrix_ij(i)).unzip();
+        let (iv, jv) = (0..triangular_matrix_len(nsamples)).map(triangular_matrix_ij).unzip();
         CrossCmpTri {
             i_viewer: iv,
             j_viewer: jv
         }
     }
-    fn get_ij_arrs<T, D>(&self, row: &ArrayBase<OwnedRepr<T>, D>) -> (ArrayBase<OwnedRepr<T>, D>, ArrayBase<OwnedRepr<T>, D>)
+
+    #[inline]
+    fn get_ij_arrs<T>(&self, row: &[T], stride: usize) -> (Vec<T>, Vec<T>)
     where
         T: Clone,
-        D: Dimension + RemoveAxis
     {
-        let i = row.select(Axis(0), &self.i_viewer);
-        let j = row.select(Axis(0), &self.j_viewer);
+        let i = Vec::from_iter(self.i_viewer.iter().flat_map(|x| (0..stride).map(|z| row[*x * stride + z].clone())));
+        let j = Vec::from_iter(self.j_viewer.iter().flat_map(|x| (0..stride).map(|z| row[*x * stride + z].clone())));
         (i, j)
     }
 }
@@ -241,18 +288,18 @@ fn gen_guiders(dists: &Vec<Option<Dists>>, limit: Option<usize>) -> Vec<Option<V
 
         chr_guiders.par_iter_mut().enumerate().for_each(|(x, target)| {
             let arr_x = corr.row(x);
-            let (arr_xi, arr_xj) = cct.get_ij_arrs(&arr_x);
-            let arr_ij = &corr.arr;
+            let (arr_xi, arr_xj) = cct.get_ij_arrs(&arr_x, 1);
+            let arr_ij = &corr.vec;
             let result = TriangularMatrix {
-                arr: arr_xi*arr_xj/arr_ij,
+                vec: zip(zip(arr_xi.iter(), arr_xj.iter()), arr_ij.iter()).map(|((a,b),c)| (**a)*(**b)/(*c)).collect(),
                 //arr_ij - arr_xi,
                 size: corr.size,
             };
-            let ((guider_idx_i, guider_idx_j), _) = result.arr.iter().enumerate().par_bridge()
+            let ((guider_idx_i, guider_idx_j), _) = result.vec.iter().enumerate()
                 .map(|(i, v)| (triangular_matrix_ij(i), *v))
                 .filter(|((pi, pj), _)| (*pi != x) && (*pj != x) && (*pi != *pj))
-                .reduce(
-                    || ((usize::MAX, usize::MAX), f64::NEG_INFINITY),
+                .fold(
+                    ((usize::MAX, usize::MAX), f64::NEG_INFINITY),
                     |((opi, opj), ov), ((npi, npj), nv)| {
                         if nv > ov {
                             ((npi, npj), nv)
@@ -264,7 +311,7 @@ fn gen_guiders(dists: &Vec<Option<Dists>>, limit: Option<usize>) -> Vec<Option<V
             
             let arr_i = corr.row(guider_idx_i);
             let arr_j = corr.row(guider_idx_j);
-            let score = (arr_i - arr_j) * arr_x;
+            let score = Vec::from_iter(zip(zip(arr_i.iter(), arr_j.iter()), arr_x.iter()).map(|((a,b),c)|((*a) - (*b)) * (*c)));
             let score = score.into_iter().enumerate();
             let mut guiders_i;
             let mut guiders_j;
@@ -354,118 +401,173 @@ fn copy_record_stuff(rec: &bcf::Record, new_rec: &mut bcf::Record) {
     new_rec.set_id(&rec.id()).unwrap();
     new_rec.set_alleles(&rec.alleles()).unwrap();
     new_rec.set_qual(rec.qual());
-    let filt: Vec<bcf::header::Id> = rec.filters().into_iter().collect();
+    let filt: Vec<bcf::header::Id> = rec.filters().collect();
     let filt: Vec<&bcf::header::Id> = filt.iter().collect();
     new_rec.set_filters(&filt).unwrap();
 }
 
-fn write_phased(input_file: &PathBuf, output_file: &Option<PathBuf>, output_type: &VcfOutputType, guiders: &Vec<Option<Vec<Guider>>>) -> Result<Vec<Option<Dists>>, rust_htslib::tpool::Error> {
+struct MyRecordWriter {
+    current_rn: usize,
+    queue: VecDeque<Option<bcf::Record>>,
+    writer: bcf::Writer,
+    parking_lot: BTreeMap<usize, Thread>
+}
+
+const WRITER_BUFFER_LIMIT: usize = 1000;
+impl MyRecordWriter {
+    fn new(writer: bcf::Writer) -> Self {
+        MyRecordWriter {
+            current_rn: 0,
+            queue: VecDeque::new(),
+            writer,
+            parking_lot: BTreeMap::new()
+        }
+    }
+    fn write(&mut self, rn: usize, record: &bcf::Record) -> Result<(), ()> {
+        assert!(rn >= self.current_rn);
+        if rn - self.current_rn > WRITER_BUFFER_LIMIT {
+            return Err(())
+        }
+        while self.queue.len() <= rn - self.current_rn {
+            self.queue.push_back(None);
+        }
+        self.queue[rn - self.current_rn] = Some(record.clone());
+        while self.queue.front().is_some() && self.queue.front().unwrap().is_some() {
+            self.current_rn += 1;
+            if let Some(rec) = self.queue.pop_front().unwrap() {
+                self.writer.write(&rec).expect("error writing record to output bcf/vcf file");
+            }
+        }
+        for (pos, thread) in self.parking_lot.iter() {
+            if pos - self.current_rn < WRITER_BUFFER_LIMIT {
+                eprintln!("unparking thread {:?}", thread.name());
+                thread.unpark();
+            }
+        }
+        Ok(())
+    }
+
+    fn alert_parked(&mut self, rn: usize, thread: Thread) {
+        self.parking_lot.insert(rn, thread);
+    }
+
+    fn empty_record(&self) -> bcf::Record {
+        self.writer.empty_record()
+    }
+}
+
+fn write_phased(input_file: &PathBuf, output_file: &Option<PathBuf>, output_type: &VcfOutputType, guiders: &[Option<Vec<Guider>>]) -> Result<Vec<Option<Dists>>, rust_htslib::tpool::Error> {
     let mut reader = bcf::Reader::from_path(input_file)?;
-    let samples: Vec<String> = reader.header().samples().iter().map(|v| String::from_utf8_lossy(*v).into_owned()).collect();
+    let samples: Vec<String> = reader.header().samples().iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect();
+    let nsamples = samples.len();
+    let ncontigs = guiders.len();
     let mut header = bcf::Header::from_template(reader.header());
     header.push_record(format!(
         r#"##FORMAT=<ID={},Number={},Type={},Description="{}">"#,
         "PQ", 1, "Integer", "Phasing quality").as_bytes());
 
-    let uncompressed = match output_type {
-        VcfOutputType::V => true,
-        VcfOutputType::U => true,
-        _ => false
-    };
+    let uncompressed = matches!(output_type, VcfOutputType::V | VcfOutputType::U);
     let htslib_format = match output_type {
         VcfOutputType::V => bcf::Format::Vcf,
         VcfOutputType::Z => bcf::Format::Vcf,
         VcfOutputType::U => bcf::Format::Bcf,
         VcfOutputType::B => bcf::Format::Bcf
     };
-    let mut writer = match output_file {
+    let writer = match output_file {
         Some(f) => bcf::Writer::from_path(f, &header, uncompressed, htslib_format),
         None => bcf::Writer::from_stdout(&header, uncompressed, htslib_format)
     }?;
-    let mut chrom_dists = vec![None; reader.header().contig_count() as usize];
-    let missing_gt: Vec<Allele> = vec![None; PLOIDY];
-    for (rn, rec_result) in reader.records().enumerate() {
+
+    let mutex_record_writer = Mutex::new(MyRecordWriter::new(writer));
+
+    let cct = CrossCmpTri::new(nsamples * PLOIDY);
+
+    let chrom_dists = reader.records().enumerate().par_bridge().map(|(rn, rec_result)| {
         let rec = match rec_result {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("skipping record {} due to problem: {}", rn, e.to_string());
-                continue
+                return None
             }
         };
         let rid = match rec.rid() {
-            Some(x) => x,
-            None => continue
+            Some(x) => x as usize,
+            None => return None
         };
         let chr_guider = match guiders.get(rid as usize) {
-            Some(x) => match x {
-                Some(y) => y,
-                None => continue,
-            },
-            None => continue,
+            Some(Some(x)) => x,
+            _ => return None,
         };
-        let cd = match chrom_dists.get_mut(rid as usize) {
-            Some(x) => match x {
-                Some(y) => y,
-                None => {
-                    let y = Dists {
-                        dist: TriangularMatrix::zeros(samples.len() * PLOIDY),
-                        cmps: TriangularMatrix::zeros(samples.len() * PLOIDY)
-                    };
-                    *x = Some(y);
-                    x.as_mut().unwrap()
-                },
-            },
-            None => continue,
-        };
-        let gts_raw = rec.genotypes()?;
-        let mut genotypes: Vec<Vec<Allele>> = Vec::with_capacity(samples.len());
-        for i in 0..samples.len() {
+        let gts_raw = rec.genotypes().expect("failed to get raw genotypes");
+        let mut genotypes: Vec<Vec<Allele>> = Vec::with_capacity(nsamples);
+        for i in 0..nsamples {
             let gt = gts_raw.get(i);
             let alleles: Vec<Allele> = gt.iter().map(get_allele).collect();
             assert!(alleles.len() == PLOIDY, "found genotype of unsopported ploidy in input file");
             genotypes.push(alleles);
         }
         
-        let mut out = vec![None; samples.len()];
+        let mut out = vec![None; nsamples];
+        let mut hts_flat = vec![0; nsamples * PLOIDY];
+        let mut mis_flat = vec![false; nsamples * PLOIDY];
 
-        zip(genotypes.iter(), out.iter_mut()).enumerate().par_bridge().for_each(|(i, (curr_gt, target))| {
+
+        for (i, ((curr_gt, target), (hts, mis)))
+        in zip(zip(genotypes.iter(), out.iter_mut()), zip(hts_flat.chunks_exact_mut(PLOIDY), mis_flat.chunks_exact_mut(PLOIDY))).enumerate() {
             if curr_gt[1..].iter().all(|x| *x == curr_gt[0]) {
-                if curr_gt[0] == None {
+                if curr_gt[0].is_none() {
                     *target = Some(((curr_gt.clone(), false), 0));
+                    for x in mis.iter_mut() {
+                        *x = true;
+                    }
                 } else {
                     *target = Some(((curr_gt.clone(), true), 100));
+                    for ((ht, mis), oht) in zip(zip(hts.iter_mut(), mis.iter_mut()), curr_gt.iter()) {
+                        match oht {
+                            Some(x) => *ht = *x,
+                            None => *mis = true
+                        }
+                    }
                 }
-                return
+                continue;
             }
 
             let sample_guider = &chr_guider[i];
-            let mut evidence = Array2::zeros(
-                [PLOIDY, max(sample_guider[0].len(), sample_guider[1].len())]
-            );
-            for t in 0..PLOIDY {
-                let guider = &sample_guider[t];
-                zip(guider.iter(), evidence.columns_mut().into_iter()).for_each(|((cmp_idx, cmp_val), mut target)| {
+            let mut evidence = vec![0.; PLOIDY * max(sample_guider[0].len(), sample_guider[1].len())];
+            for (t, sg) in sample_guider.iter().enumerate() {
+                let guider = sg;
+                zip(guider.iter(), evidence.chunks_exact_mut(PLOIDY)).for_each(|((cmp_idx, cmp_val), target)| {
                     let cmp_gt = &genotypes[*cmp_idx];
-                    for u in 0..PLOIDY {
-                        if curr_gt[u] == None {
+                    for (u, cgt) in curr_gt.iter().enumerate() {
+                        if curr_gt[u].is_none() {
                             continue;
                         }
-                        if cmp_gt.contains(&curr_gt[u]) {
+                        if cmp_gt.contains(cgt) {
                             // exclusive to diploid
                             let evidence_dest = if t == u { 0 } else { 1 };
-                            target[[evidence_dest]] += cmp_val;
+                            target[evidence_dest] += cmp_val;
                         }
                     }
                 })
             }
-            let evidence: [f64; PLOIDY] = [evidence.row(0).sum(), evidence.row(1).sum()];
+            let evidence: [f64; PLOIDY] = evidence.chunks_exact(PLOIDY).fold([0.; PLOIDY], |acc, x| [acc[0] + x[0], acc[1] + x[1]]);
+            // [evidence.row(0).sum(), evidence.row(1).sum()];
 
             let mut out_gt = curr_gt.clone();
             // exclusive to diploid
             if evidence[0] == evidence[1] {
                 *target = Some(((out_gt, false), 0));
+                for x in mis.iter_mut() {
+                    *x = true;
+                }
             } else if evidence[0] > evidence[1] {
                 let score = (-10. * (1. - evidence[0] / (evidence[0] + evidence[1])).log10()).round();
+                for ((ht, mis), oht) in zip(zip(hts.iter_mut(), mis.iter_mut()), out_gt.iter()) {
+                    match oht {
+                        Some(x) => *ht = *x,
+                        None => *mis = true
+                    }
+                }
                 *target = Some((
                     (out_gt, true),
                     score.min(100.) as i32
@@ -473,38 +575,71 @@ fn write_phased(input_file: &PathBuf, output_file: &Option<PathBuf>, output_type
             } else {
                 let score = (-10. * (1. - evidence[1] / (evidence[0] + evidence[1])).log10()).round();
                 out_gt.reverse();
+                for ((ht, mis), oht) in zip(zip(hts.iter_mut(), mis.iter_mut()), out_gt.iter()) {
+                    match oht {
+                        Some(x) => *ht = *x,
+                        None => *mis = true
+                    }
+                }
                 *target = Some((
                     (out_gt, true),
                     score.min(100.) as i32
                 ));
             }
-        });
+        }
 
-        let mut new_rec = writer.empty_record();
+        let mut new_rec = mutex_record_writer.lock().unwrap().empty_record();
 
         copy_record_stuff(&rec, &mut new_rec);
 
         let (out_genotypes, phasing_scores): (Vec<(Vec<Allele>, bool)>, Vec<i32>) = out.into_iter().map(|x| x.unwrap()).unzip();
-        let gts_flat = out_genotypes.iter().map(
-            |(a, p)| if *p {(*a).iter()} else {missing_gt.iter()}
-        ).flatten();
 
-        for (i, gt1) in gts_flat.clone().enumerate() {
-            for (j, gt2) in gts_flat.clone().take(i+1).enumerate() {
-                if *gt2 == None {
-                    continue;
+        let (ht_i, ht_j) = cct.get_ij_arrs(&hts_flat, 1);
+        let (ms_i, ms_j) = cct.get_ij_arrs(&mis_flat, 1);
+
+        let (distances, comparisons): (Vec<u128>, Vec<u128>) = 
+            zip(zip(ht_i, ht_j), zip(ms_i, ms_j))
+            .map(|((hta, htb), (msa, msb))| 
+                (if !msa && !msb && hta != htb {1} else {0}, if !msa && !msb {1} else {0})
+            ).unzip();
+
+        new_rec.push_genotypes(
+            &out_genotypes.into_iter()
+                .flat_map(|(alleles, phased)| to_genotype(&alleles, phased))
+                .collect::<Vec<bcf::record::GenotypeAllele>>()
+        ).expect("failed to push genotypes to new vcf/bcf record");
+        
+        new_rec.push_format_integer(b"PQ", &phasing_scores).expect("failed to set PQ format tag for vcf/bcf record");
+        while mutex_record_writer.lock().unwrap().write(rn, &new_rec).is_err() {
+            let ct = thread::current();
+            eprintln!("parking thread {:?}", ct.name());
+            mutex_record_writer.lock().unwrap().alert_parked(rn, ct);
+            thread::park();
+        }
+        Some((rid, Dists {
+            dist: TriangularMatrix{vec: Vec::from_iter(distances), size: nsamples * 2},
+            cmps: TriangularMatrix{vec: Vec::from_iter(comparisons), size: nsamples * 2}
+        }))
+    }).fold(|| vec![None; ncontigs], |mut acc: Vec<Option<Dists>>, incr| {
+        if let Some((rid, inc_dists)) = incr {
+            match acc.get_mut(rid).unwrap() {
+                Some(v) => *v += inc_dists,
+                None => *acc.get_mut(rid).unwrap() = Some(inc_dists),
+            };
+        }
+        acc
+    }).reduce(|| vec![None; ncontigs], |mut acc, incr| {
+        for (target_dists, incr_dists) in zip(acc.iter_mut(), incr.iter()) {
+            if let Some(targ_d) = target_dists {
+                if let Some(incr_d) = incr_dists {
+                    *targ_d += incr_d
                 }
-                if gt1 != gt2 {
-                    cd.dist[[i, j]] += 1;
-                }
-                cd.cmps[[i, j]] += 1;
+            } else {
+                *target_dists = incr_dists.clone();
             }
         }
-
-        new_rec.push_genotypes(&out_genotypes.into_iter().map(|(alleles, phased)| to_genotype(&alleles, phased)).flatten().collect::<Vec<bcf::record::GenotypeAllele>>())?;
-        new_rec.push_format_integer(b"PQ", &phasing_scores)?;
-        writer.write(&new_rec)?;
-    }
+        acc
+    });
     Ok(chrom_dists)
 }
 
@@ -524,20 +659,40 @@ fn main() {
 
     match &cli.command {
         Some(Commands::GenerateTest { file }) => {
-            match make_test(file) {
-                Err(e) => {
-                    eprintln!("{}", e.to_string());
-                },
-                _ => {}
-            };
+            if let Err(e) = make_test(file) {
+                eprintln!("{}", e.to_string());
+            }
         },
-        Some(Commands::Run { input_file, output: output_file, stats_file: stat_file, max_guiders, output_type: output }) => {
+        Some(Commands::Run { input_file, output: output_file, stats_file, max_guiders, output_type: output, use_stats }) => {
+            let (stats_read_qr, stats_read_g) = if let Some(stats_from) = use_stats {
+                let use_stats_file: StatsFile = 
+                    serde_json::from_reader(
+                        File::open(stats_from).expect("error reading input stats file")
+                    ).expect("error parsing input stats file");
+                eprintln!("(read stats file)");
+                (
+                    if let Some(read_sd) = use_stats_file.sample_distances {
+                        Some((read_sd, use_stats_file.contigs, use_stats_file.samples))
+                    } else {
+                        None
+                    },
+                    use_stats_file.guiders
+                )
+            } else {
+                (None, None)
+            };
+            
             eprintln!("starting quick read");
+            let (dists, contig_names, sample_names) = if let Some(qr_read) = stats_read_qr {
+                eprintln!("(using imported distances)");
+                qr_read
+            } else {
+                quick_read(input_file).expect("error during first read")
+            };
 
-            let (dists, contig_names, sample_names) = quick_read(input_file).expect("error during first read");
             eprintln!("distances calculated");
 
-            if let Some(stats_dest) = stat_file {
+            if let Some(stats_dest) = stats_file {
                 let stats = StatsFile {
                     samples: sample_names.clone(),
                     contigs: contig_names.clone(),
@@ -550,13 +705,20 @@ fn main() {
                 f.write_all(json_out.as_bytes()).expect("error writing to stats file");
             }
 
-            let guiders = gen_guiders(&dists, match max_guiders {
-                Some(_x @ 0) => None,
-                Some(x) => Some(*x),
-                None => Some(5)
-            });
+
+            let guiders = if let Some(g_read) = stats_read_g {
+                eprintln!("(using imported guiders)");
+                g_read
+            } else {
+                gen_guiders(&dists, match max_guiders {
+                    Some(_x @ 0) => None,
+                    Some(x) => Some(*x),
+                    None => Some(5)
+                })
+            };
+
             eprintln!("guiders generated");
-            if let Some(stats_dest) = stat_file {
+            if let Some(stats_dest) = stats_file {
                 let stats = StatsFile {
                     samples: sample_names.clone(),
                     contigs: contig_names.clone(),
@@ -571,7 +733,7 @@ fn main() {
 
             let out_matrix = write_phased(input_file, output_file,  &output.unwrap_or(VcfOutputType::B), &guiders).expect("error during phasing");
             eprintln!("done phasing");
-            if let Some(stats_dest) = stat_file {
+            if let Some(stats_dest) = stats_file {
                 let stats = StatsFile {
                     samples: sample_names,
                     contigs: contig_names,
